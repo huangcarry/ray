@@ -175,6 +175,25 @@ def test_error_entries_counted_separately():
     assert info.incomplete is False
 
 
+def test_error_and_data_entries_mixed():
+    # An error entry coexisting with a data entry exercises the non-empty
+    # snapshot path, where failed entries are counted separately and never
+    # attributed to a device while the valid entry remains queryable.
+    store = RDTStore()
+    store.add_object("obj_err", RuntimeError("recv failed"))
+    tensor = torch.empty(6, dtype=torch.float32)
+    store.add_object("obj_data", [tensor])
+    info = _snapshot(store)
+    assert info.num_error_entries == 1
+    assert info.incomplete is False
+    row = _row(info, "cpu")
+    assert row is not None
+    assert row.num_objects == 1
+    assert row.num_copies == 1
+    assert row.tensor_count == 1
+    assert row.tensor_bytes == 6 * 4
+
+
 def test_custom_payload_is_incomplete_not_zero():
     store = RDTStore()
     store.add_object("obj_custom", [object()])
