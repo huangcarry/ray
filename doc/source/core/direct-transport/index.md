@@ -322,6 +322,54 @@ Because of a known issue, Ray doesn't currently support storing different GPU ob
     * Any unexpected system bugs.
 
 
+## Inspect an actor's RDT memory usage
+
+Use {func}`ray.experimental.get_memory_info <ray.experimental.get_memory_info>` to inspect the RDT objects stored on a single actor. This is a synchronous, opt-in diagnostic query of the actor you pass in. It doesn't scan the cluster, and it doesn't integrate with the `ray memory` CLI.
+
+The query returns an {class}`RDTMemoryInfo <ray.experimental.RDTMemoryInfo>` snapshot with per-device rows and a few scalar totals:
+
+* `num_objects` and `num_copies`: unique RDT object IDs and queued copies that touch each device.
+* `tensor_count` and `tensor_bytes`: logical tensor occurrences and their `numel * element_size` sum.
+* `referenced_storage_bytes`: the deduplicated tensor backing storage referenced on each device.
+
+To call it, the actor must have been created with `@ray.remote(enable_tensor_transport=True)`, because the query runs in the actor's `_ray_system` concurrency group, which exists only for tensor-transport-enabled actors:
+
+```python
+import torch
+import ray
+from ray.experimental import get_memory_info
+
+@ray.remote(num_gpus=1, enable_tensor_transport=True)
+class Worker:
+    @ray.method(tensor_transport="nixl")
+    def make_tensor(self):
+        return torch.randn(1024, device="cuda")
+
+    def ready(self):
+        return True
+
+worker = Worker.remote()
+ref = worker.make_tensor.remote()
+
+# Synchronize on an ordinary actor method so the tensor exists in the actor's
+# store before you query it. Don't fetch the tensor itself just to inspect its
+# metadata.
+ray.get(worker.ready.remote())
+
+info = get_memory_info(worker)
+for row in info.devices:
+    print(row.device, row.num_objects, row.tensor_bytes, row.referenced_storage_bytes)
+```
+
+Keep the following in mind when you read the numbers:
+
+* Device keys are process-local (`cuda:0`, `cpu`), not global GPU identities, and Ray performs no cross-process or cross-actor deduplication.
+* `referenced_storage_bytes` is referenced tensor backing storage. It isn't allocated or cached CUDA memory, registered bytes, NIXL pool utilization, or free GPU memory.
+* Ray deduplicates overlapping backing-storage spans, so tensor views, repeated references, and overlapping external buffers count once. A view into an allocator pool references the whole pool, so `referenced_storage_bytes` might exceed `tensor_bytes`. Repeated or overlapping tensor occurrences, by contrast, make `tensor_bytes` exceed the deduplicated `referenced_storage_bytes`.
+* A failed receive is counted in `num_error_entries`, never as a zero-byte allocation on a device.
+* When some entries can't be inspected, such as a custom payload or an unsupported tensor layout, `incomplete` is `True` and `num_uninspectable_tensors` counts them. The `unsupported` list holds deduplicated reasons. These entries are never guessed as zero.
+* `timeout` bounds only your `ray.get` wait. It doesn't cancel a diagnostic that's already queued or running on the actor.
+
 ## Advanced: Registering a custom tensor transport
 
 You can register custom tensor transports at runtime for use with RDT. To add a custom tensor transport, implement the abstract interface {class}`ray.experimental.TensorTransportManager <ray.experimental.TensorTransportManager>` and register it with {func}`ray.experimental.register_tensor_transport <ray.experimental.register_tensor_transport>`.

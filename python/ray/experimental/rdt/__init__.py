@@ -4,6 +4,11 @@ from ray.experimental.rdt.rdt_manager import (
     set_target_for_ref,
     wait_tensor_freed,
 )
+from ray.experimental.rdt.rdt_store import (
+    RDTDeviceMemoryInfo,
+    RDTMemoryInfo,
+    get_memory_info,
+)
 from ray.experimental.rdt.tensor_transport_manager import (
     CommunicatorMetadata,
     TensorTransportManager,
@@ -30,4 +35,7 @@ __all__ = [
     "CommunicatorMetadata",
     "set_target_for_ref",
     "set_target_device_for_ref",
+    "get_memory_info",
+    "RDTMemoryInfo",
+    "RDTDeviceMemoryInfo",
 ]

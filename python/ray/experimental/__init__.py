@@ -2,10 +2,13 @@ from ray.experimental.dynamic_resources import set_resource
 from ray.experimental.locations import get_local_object_locations, get_object_locations
 from ray.experimental.rdt import (
     CommunicatorMetadata,
+    RDTDeviceMemoryInfo,
     RDTManager,
+    RDTMemoryInfo,
     TensorTransportManager,
     TensorTransportMetadata,
     deregister_nixl_memory,
+    get_memory_info,
     register_nixl_memory,
     register_nixl_memory_pool,
     register_tensor_transport,
@@ -31,4 +34,7 @@ __all__ = [
     "CommunicatorMetadata",
     "set_target_for_ref",
     "set_target_device_for_ref",
+    "get_memory_info",
+    "RDTMemoryInfo",
+    "RDTDeviceMemoryInfo",
 ]

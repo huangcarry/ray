@@ -12,12 +12,84 @@ from ray.experimental.rdt.util import (
     device_match_transport,
     get_tensor_transport_manager,
 )
+from ray.util.annotations import PublicAPI
 
 if TYPE_CHECKING:
     import torch
 
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on the public `get_memory_info` timeout. The timeout only bounds
+# the caller's `ray.get` wait; it does not cancel a diagnostic already queued
+# or running on the actor.
+_MAX_MEMORY_INFO_TIMEOUT_SECONDS = 3600.0
+
+
+@PublicAPI(stability="alpha")
+@dataclass
+class RDTDeviceMemoryInfo:
+    """Per-device memory accounting for a single process-local device.
+
+    Device keys are process-local (``"cpu"``, ``"cuda:0"``), not global GPU
+    identities. No cross-process or cross-actor deduplication is claimed.
+
+    Args:
+        device: The process-local device key.
+        num_objects: Number of unique RDT object IDs that have at least one
+            non-error entry touching this device.
+        num_copies: Number of queued non-error RDT object entries (copies)
+            touching this device.
+        tensor_count: Number of logical tensor occurrences on this device.
+        tensor_bytes: Sum of ``numel * element_size`` over every tensor
+            occurrence on this device.
+        referenced_storage_bytes: Total bytes of tensor backing storage
+            referenced on this device, deduplicated over overlapping byte spans.
+    """
+
+    device: str
+    num_objects: int
+    num_copies: int
+    tensor_count: int
+    tensor_bytes: int
+    referenced_storage_bytes: int
+
+
+@PublicAPI(stability="alpha")
+@dataclass
+class RDTMemoryInfo:
+    """A snapshot of one actor's RDT store memory accounting.
+
+    This is referenced tensor backing storage, not allocated or cached CUDA
+    memory, registered bytes, NIXL pool utilization, or free/available GPU
+    memory.
+
+    Args:
+        actor_id: The actor's ID.
+        node_id: The node ID of the process hosting the actor.
+        pid: The OS process ID of the actor's worker.
+        devices: Per-device accounting, sorted by device key.
+        num_error_entries: Number of failed/error entries in the store (for
+            example, a failed receive). These are never attributed to a device.
+        num_uninspectable_tensors: Number of stored tensors or payloads that
+            could not be inspected, such as custom payloads or unsupported
+            tensor layouts or devices. These are never guessed as zero.
+        incomplete: Whether any stored entry or tensor could not be fully
+            accounted for. When True, the numeric fields cover only the entries
+            that could be inspected.
+        unsupported: Deduplicated, stable categories describing why entries
+            could not be accounted for when ``incomplete`` is True. Categories
+            never include raw tensor addresses.
+    """
+
+    actor_id: str
+    node_id: str
+    pid: int
+    devices: List[RDTDeviceMemoryInfo]
+    num_error_entries: int
+    num_uninspectable_tensors: int
+    incomplete: bool
+    unsupported: List[str]
 
 
 def __ray_send__(
@@ -144,6 +216,169 @@ def __ray_fetch_rdt_object__(self, obj_id: str):
     rdt_store = global_worker.rdt_manager.rdt_store
     rdt_object = rdt_store.wait_and_get_object(obj_id)
     return rdt_object
+
+
+def _validate_memory_info_timeout(timeout: float) -> None:
+    """Validate the public `get_memory_info` timeout argument."""
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError(f"timeout must be a positive finite number, got {timeout!r}.")
+    # Check the upper bound before math.isfinite: converting a huge integer to
+    # float inside math.isfinite would raise OverflowError.
+    if timeout > _MAX_MEMORY_INFO_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"timeout must be at most {_MAX_MEMORY_INFO_TIMEOUT_SECONDS} seconds, "
+            f"got {timeout!r}."
+        )
+    import math
+
+    if not math.isfinite(timeout):
+        raise ValueError(f"timeout must be finite, got {timeout!r}.")
+    if timeout <= 0:
+        raise ValueError(f"timeout must be positive, got {timeout!r}.")
+
+
+def _inspect_tensor(
+    tensor: Any, torch: Optional[Any]
+) -> Tuple[Optional[Tuple[str, int, int, int]], Optional[str]]:
+    """Inspect one stored tensor for memory accounting.
+
+    Returns ``((device, span_start, span_end, tensor_bytes), None)`` for a
+    supported torch strided CPU/CUDA tensor, where the byte span covers the
+    tensor's whole backing storage. Returns ``(None, category)`` when the tensor
+    cannot be accounted for, where ``category`` is a stable, deduplicatable
+    string that never embeds raw addresses or arbitrary payload state. Never
+    invokes ``__sizeof__`` on arbitrary payloads.
+    """
+    if torch is None or not isinstance(tensor, torch.Tensor):
+        return None, f"unsupported_object_type:{type(tensor).__name__}"
+    try:
+        if tensor.layout != torch.strided:
+            return None, f"unsupported_tensor_layout:{tensor.layout}"
+        if tensor.device.type not in ("cpu", "cuda"):
+            return None, f"unsupported_tensor_device:{tensor.device.type}"
+        storage = tensor.untyped_storage()
+        start = storage.data_ptr()
+        nbytes = storage.nbytes()
+        tensor_bytes = tensor.numel() * tensor.element_size()
+    except Exception:
+        # Custom tensor subclasses may raise on any of the above accesses; keep
+        # the supported entries queryable and report a controlled, address-free
+        # reason rather than propagating.
+        return None, "failed_storage_read"
+    return (str(tensor.device), start, start + nbytes, tensor_bytes), None
+
+
+def _union_span_bytes(spans: List[Tuple[int, int]]) -> int:
+    """Return the total bytes covered by the union of ``[start, end)`` spans.
+
+    Zero-length spans are dropped so empty storages never alias unrelated
+    objects.
+    """
+    spans = [(start, end) for start, end in spans if end > start]
+    if not spans:
+        return 0
+    spans.sort()
+    total = 0
+    cur_start, cur_end = spans[0]
+    for start, end in spans[1:]:
+        if start <= cur_end:
+            cur_end = max(cur_end, end)
+        else:
+            total += cur_end - cur_start
+            cur_start, cur_end = start, end
+    total += cur_end - cur_start
+    return total
+
+
+def __ray_get_memory_info__(self) -> RDTMemoryInfo:
+    """Helper that runs on the actor to build an RDT memory snapshot.
+
+    Reads the worker's backing ``_rdt_manager`` and ``_rdt_store`` fields
+    directly rather than through their lazily-creating properties, so querying
+    an actor that has never used RDT returns a zero snapshot without creating
+    an ``RDTStore`` or importing torch.
+    """
+    import os
+
+    import ray
+    from ray._private.worker import global_worker
+
+    runtime_context = ray.get_runtime_context()
+    actor_id = runtime_context.get_actor_id() or ""
+    node_id = runtime_context.get_node_id() or ""
+    pid = os.getpid()
+
+    rdt_manager = global_worker._rdt_manager
+    if rdt_manager is None or rdt_manager._rdt_store is None:
+        return RDTMemoryInfo(
+            actor_id=actor_id,
+            node_id=node_id,
+            pid=pid,
+            devices=[],
+            num_error_entries=0,
+            num_uninspectable_tensors=0,
+            incomplete=False,
+            unsupported=[],
+        )
+    return rdt_manager._rdt_store.get_memory_info_snapshot(actor_id, node_id, pid)
+
+
+@PublicAPI(stability="alpha")
+def get_memory_info(actor: Any, *, timeout: float = 10.0) -> RDTMemoryInfo:
+    """Return a snapshot of one actor's RDT store memory accounting.
+
+    This is an opt-in, synchronous diagnostic query of the provided actor
+    handle. It runs on the actor in the ``_ray_system`` concurrency group and
+    returns per-device object counts, logical tensor bytes, and deduplicated
+    referenced backing-storage bytes. It is not an automatic cluster scan and
+    does not integrate with the ``ray memory`` CLI.
+
+    The returned bytes describe referenced tensor backing storage, not
+    allocated or cached CUDA memory, registered bytes, NIXL pool utilization,
+    or free/available GPU memory. A view into an allocator pool references the
+    whole pool, so logical ``tensor_bytes`` may exceed
+    ``referenced_storage_bytes`` due to repeated or overlapping views.
+
+    Args:
+        actor: The actor to query. Must be created with
+            ``@ray.remote(enable_tensor_transport=True)`` so the ``_ray_system``
+            concurrency group exists.
+        timeout: Maximum time in seconds to wait for the result. Must be a
+            positive, finite number no greater than
+            ``_MAX_MEMORY_INFO_TIMEOUT_SECONDS``. The timeout only bounds the
+            caller's ``ray.get`` wait; it does not cancel a diagnostic already
+            queued or running on the actor.
+
+    Returns:
+        An :class:`RDTMemoryInfo` snapshot.
+
+    Raises:
+        TypeError: If ``actor`` is not an actor handle.
+        ValueError: If the actor does not have tensor transport enabled, or if
+            ``timeout`` is invalid.
+    """
+    import ray
+    from ray.actor import ActorHandle
+
+    if not isinstance(actor, ActorHandle):
+        raise TypeError(
+            "get_memory_info expects an actor handle, got "
+            f"{type(actor).__name__}. Pass an actor created with "
+            "@ray.remote(enable_tensor_transport=True)."
+        )
+    if not getattr(actor, "_ray_enable_tensor_transport", False):
+        raise ValueError(
+            "get_memory_info requires an actor created with "
+            "@ray.remote(enable_tensor_transport=True). The diagnostic runs in "
+            "the actor's _ray_system concurrency group, which exists only for "
+            "tensor-transport-enabled actors."
+        )
+    _validate_memory_info_timeout(timeout)
+
+    ref = actor.__ray_call__.options(concurrency_group="_ray_system").remote(
+        __ray_get_memory_info__
+    )
+    return ray.get(ref, timeout=timeout)
 
 
 @dataclass
@@ -358,3 +593,115 @@ class RDTStore:
         with self._lock:
             # Count total objects across all queues
             return sum(len(queue) for queue in self._rdt_store.values())
+
+    def get_memory_info_snapshot(
+        self, actor_id: str, node_id: str, pid: int
+    ) -> RDTMemoryInfo:
+        """Return a snapshot of this store's memory accounting.
+
+        Runs a brief O(tensor_count) scan under the existing store lock that
+        collects only immutable scalar metadata (device string, data pointer,
+        byte count, numel, element size). Interval deduplication and sorting
+        happen after releasing the lock. No tensor or storage references escape
+        the method, so the query cannot extend tensor lifetime beyond this
+        bounded call.
+
+        Args:
+            actor_id: The actor ID to record in the snapshot.
+            node_id: The node ID to record in the snapshot.
+            pid: The process ID to record in the snapshot.
+
+        Returns:
+            An :class:`RDTMemoryInfo` snapshot. An empty store returns accurate
+            zero counts without importing torch.
+        """
+        # Check whether any non-error entry holds data to inspect. If not,
+        # return an accurate zero snapshot without importing torch.
+        with self._lock:
+            has_data = any(
+                entry.error is None and len(entry.data) > 0
+                for queue in self._rdt_store.values()
+                for entry in queue
+            )
+            if not has_data:
+                return RDTMemoryInfo(
+                    actor_id=actor_id,
+                    node_id=node_id,
+                    pid=pid,
+                    devices=[],
+                    num_error_entries=sum(
+                        1
+                        for queue in self._rdt_store.values()
+                        for entry in queue
+                        if entry.error is not None
+                    ),
+                    num_uninspectable_tensors=0,
+                    incomplete=False,
+                    unsupported=[],
+                )
+
+        torch = None
+        try:
+            import torch
+        except ImportError:
+            torch = None
+
+        object_ids_per_device: Dict[str, Set[str]] = defaultdict(set)
+        num_copies: Dict[str, int] = defaultdict(int)
+        tensor_count: Dict[str, int] = defaultdict(int)
+        tensor_bytes: Dict[str, int] = defaultdict(int)
+        spans_per_device: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        num_error_entries = 0
+        num_uninspectable_tensors = 0
+        unsupported_categories: Set[str] = set()
+        incomplete = False
+
+        with self._lock:
+            for obj_id, queue in self._rdt_store.items():
+                for entry in queue:
+                    if entry.error is not None:
+                        num_error_entries += 1
+                        continue
+                    touched_devices: Set[str] = set()
+                    for tensor in entry.data:
+                        accounting, reason = _inspect_tensor(tensor, torch)
+                        if accounting is None:
+                            incomplete = True
+                            num_uninspectable_tensors += 1
+                            unsupported_categories.add(reason)
+                            continue
+                        device, start, end, tbytes = accounting
+                        touched_devices.add(device)
+                        tensor_count[device] += 1
+                        tensor_bytes[device] += tbytes
+                        spans_per_device[device].append((start, end))
+                    for device in touched_devices:
+                        object_ids_per_device[device].add(obj_id)
+                        num_copies[device] += 1
+
+        # Compute referenced-storage interval unions outside the lock.
+        devices = []
+        for device in sorted(spans_per_device.keys()):
+            devices.append(
+                RDTDeviceMemoryInfo(
+                    device=device,
+                    num_objects=len(object_ids_per_device[device]),
+                    num_copies=num_copies[device],
+                    tensor_count=tensor_count[device],
+                    tensor_bytes=tensor_bytes[device],
+                    referenced_storage_bytes=_union_span_bytes(
+                        spans_per_device[device]
+                    ),
+                )
+            )
+
+        return RDTMemoryInfo(
+            actor_id=actor_id,
+            node_id=node_id,
+            pid=pid,
+            devices=devices,
+            num_error_entries=num_error_entries,
+            num_uninspectable_tensors=num_uninspectable_tensors,
+            incomplete=incomplete,
+            unsupported=sorted(unsupported_categories),
+        )
